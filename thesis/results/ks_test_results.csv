@@ -1,0 +1,4 @@
+feature,ks_statistic,ks_pvalue
+log1p(amount),0.3209,1e-323
+log1p(old_balance_origin),0.3166,1e-323
+log1p(old_balance_dest),0.3228,1e-323
