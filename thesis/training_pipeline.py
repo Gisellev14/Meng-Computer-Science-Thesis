@@ -9,7 +9,7 @@ from sklearn.model_selection import (
     GridSearchCV,
     StratifiedKFold,
 )
-from sklearn.preprocessing import OneHotEncoder
+from sklearn.preprocessing import OneHotEncoder, label_binarize
 from sklearn.metrics import (
     classification_report,
     confusion_matrix,
@@ -24,7 +24,6 @@ from sklearn.metrics import (
 
 
 # Algorithm catalogue: each entry defines a base estimator and its hyperparameter grid.
-# Gradient boosting grid kept small because each fit is sequential (no n_jobs benefit).
 ALGORITHM_CATALOGUE = {
     "dummy": {
         "estimator": lambda rs: DummyClassifier(strategy="prior", random_state=rs),
@@ -66,27 +65,29 @@ ALGORITHM_CATALOGUE = {
 
 
 def _encode_features(X_train, X_test, categorical_cols):
-    """Fit OneHotEncoder on training data only, then transform both splits."""
+    """Fit OneHotEncoder on training data only, then transform both splits.
+
+    Returns the fitted encoder so the caller can reuse it for additional splits
+    (e.g. a held-out test set) without refitting on a different data slice.
+    """
     if not categorical_cols:
-        return X_train, X_test, X_train.columns.tolist()
+        encoder = None
+        return X_train, X_test, X_train.columns.tolist(), encoder
 
     encoder = OneHotEncoder(sparse_output=False, drop="first", handle_unknown="ignore")
     encoder.fit(X_train[categorical_cols])
 
-    ohe_train = pd.DataFrame(
-        encoder.transform(X_train[categorical_cols]),
-        columns=encoder.get_feature_names_out(categorical_cols),
-        index=X_train.index,
-    )
-    ohe_test = pd.DataFrame(
-        encoder.transform(X_test[categorical_cols]),
-        columns=encoder.get_feature_names_out(categorical_cols),
-        index=X_test.index,
-    )
+    def _apply(X):
+        ohe = pd.DataFrame(
+            encoder.transform(X[categorical_cols]),
+            columns=encoder.get_feature_names_out(categorical_cols),
+            index=X.index,
+        )
+        return pd.concat([X.drop(columns=categorical_cols), ohe], axis=1)
 
-    X_train = pd.concat([X_train.drop(columns=categorical_cols), ohe_train], axis=1)
-    X_test = pd.concat([X_test.drop(columns=categorical_cols), ohe_test], axis=1)
-    return X_train, X_test, X_train.columns.tolist()
+    X_train = _apply(X_train)
+    X_test  = _apply(X_test)
+    return X_train, X_test, X_train.columns.tolist(), encoder
 
 
 def _build_threshold_table(y_true, y_scores, p_series=None):
@@ -213,6 +214,7 @@ def run_training_pipeline(
     val_size: float = 0.125,
     random_state: int = 42,
     run_grid_search: bool = True,
+    fixed_params: dict = None,
 ):
     """
     Reusable pipeline for behavioral, transaction-only, and combined fraud models.
@@ -291,18 +293,14 @@ def run_training_pipeline(
         )
         p_train, p_val, p_test = None, None, None
 
-    # One-hot encode: fit on train, transform train/val/test
-    X_train, X_val, feature_names = _encode_features(X_train, X_val, categorical_cols)
-    # Re-encode test with same schema (refit not needed, but we use the helper)
-    # We need to match columns — simpler to encode val+test together from train schema
-    if categorical_cols:
-        encoder = OneHotEncoder(
-            sparse_output=False, drop="first", handle_unknown="ignore"
-        )
-        encoder.fit(X_trainval[categorical_cols])
+    # One-hot encode: fit on train only, reuse the same encoder for val and test
+    X_train, X_val, feature_names, ohe_encoder = _encode_features(
+        X_train, X_val, categorical_cols
+    )
+    if categorical_cols and ohe_encoder is not None:
         ohe_test = pd.DataFrame(
-            encoder.transform(X_test[categorical_cols]),
-            columns=encoder.get_feature_names_out(categorical_cols),
+            ohe_encoder.transform(X_test[categorical_cols]),
+            columns=ohe_encoder.get_feature_names_out(categorical_cols),
             index=X_test.index,
         )
         X_test = pd.concat([X_test.drop(columns=categorical_cols), ohe_test], axis=1)
@@ -317,7 +315,13 @@ def run_training_pipeline(
         average_precision_score, response_method="predict_proba"
     )
 
-    if run_grid_search and param_grid:
+    if fixed_params is not None:
+        # Use caller-supplied hyperparameters (e.g. best params from a prior grid search)
+        base_model.set_params(**fixed_params)
+        model = base_model
+        model.fit(X_train, y_train)
+        print(f"\n=== {model_name} | Using fixed hyperparameters (no grid search) ===")
+    elif run_grid_search and param_grid:
         print(f"\n=== Starting Grid Search: {model_name} ({algorithm}) ===")
         grid_search = GridSearchCV(
             estimator=base_model,
@@ -335,83 +339,146 @@ def run_training_pipeline(
         model = base_model
         model.fit(X_train, y_train)
 
-    # --- Threshold tuning on VALIDATION set (not test) ---
-    y_val_scores = model.predict_proba(X_val)[:, 1]
-    val_threshold_table = _build_threshold_table(y_val, y_val_scores, p_val)
-
-    # T_op: Operational threshold (precision >= threshold_precision_constraint)
-    best_threshold, _ = _select_best_threshold(
-        val_threshold_table, threshold_precision_constraint
-    )
-    # T_high: DENY threshold (precision >= deny_precision_constraint)
-    deny_threshold, _ = _select_deny_threshold(
-        val_threshold_table, deny_precision_constraint
-    )
-    if deny_threshold is None:
-        deny_threshold = best_threshold  # fallback if model can't meet 70%
-    # T_low: REVIEW threshold (recall-constrained)
-    review_threshold, _ = _select_review_threshold(
-        val_threshold_table, review_recall_constraint
-    )
-    # Ensure T_low <= T_op <= T_high
-    if review_threshold > best_threshold:
-        review_threshold = best_threshold
-    if best_threshold > deny_threshold:
-        best_threshold = deny_threshold
-
-    print(
-        f"\n=== {model_name} | Thresholds (validation set): "
-        f"T_low={review_threshold}, T_op={best_threshold}, T_high={deny_threshold} ==="
-    )
+    n_classes = len(np.unique(y_train))
+    classes   = sorted(np.unique(y_train))
 
     # --- Final evaluation on TEST set ---
-    y_pred = model.predict(X_test)
-    y_scores = model.predict_proba(X_test)[:, 1]
+    y_pred   = model.predict(X_test)
+    y_proba  = model.predict_proba(X_test)
 
-    print(f"\n=== {model_name} | Classification Report (threshold=0.5) ===")
+    print(f"\n=== {model_name} | Classification Report ===")
     print(classification_report(y_test, y_pred, zero_division=0))
 
     print(f"\n=== {model_name} | Confusion Matrix ===")
     print(confusion_matrix(y_test, y_pred))
 
-    roc_auc = roc_auc_score(y_test, y_scores)
-    print(f"\n=== {model_name} | ROC-AUC: {roc_auc:.4f} ===")
+    # ------------------------------------------------------------------ #
+    #  Binary path: threshold tuning + binary metrics                     #
+    # ------------------------------------------------------------------ #
+    if n_classes == 2:
+        y_val_scores = model.predict_proba(X_val)[:, 1]
+        val_threshold_table = _build_threshold_table(y_val, y_val_scores, p_val)
 
-    pr_auc = average_precision_score(y_test, y_scores)
-    print(f"\n=== {model_name} | PR-AUC: {pr_auc:.4f} ===")
+        best_threshold, _ = _select_best_threshold(
+            val_threshold_table, threshold_precision_constraint
+        )
+        deny_threshold, _ = _select_deny_threshold(
+            val_threshold_table, deny_precision_constraint
+        )
+        if deny_threshold is None:
+            deny_threshold = best_threshold
+        review_threshold, _ = _select_review_threshold(
+            val_threshold_table, review_recall_constraint
+        )
+        if review_threshold > best_threshold:
+            review_threshold = best_threshold
+        if best_threshold > deny_threshold:
+            best_threshold = deny_threshold
 
-    # PR Curve (on test set for reporting)
-    precision_curve, recall_curve, pr_thresholds = precision_recall_curve(
-        y_test, y_scores
-    )
+        print(
+            f"\n=== {model_name} | Thresholds (validation set): "
+            f"T_low={review_threshold}, T_op={best_threshold}, T_high={deny_threshold} ==="
+        )
 
-    # Full threshold table on test set (for reporting only — threshold already chosen)
-    test_threshold_table = _build_threshold_table(y_test, y_scores, p_test)
+        y_scores = y_proba[:, 1]
+        roc_auc  = roc_auc_score(y_test, y_scores)
+        pr_auc   = average_precision_score(y_test, y_scores)
+        precision_curve, recall_curve, pr_thresholds = precision_recall_curve(
+            y_test, y_scores
+        )
 
-    # Best row at the pre-selected threshold
-    best_row_mask = test_threshold_table["threshold"] == round(best_threshold, 2)
-    if best_row_mask.any():
-        best_row = test_threshold_table.loc[best_row_mask].iloc[0]
+        test_threshold_table = _build_threshold_table(y_test, y_scores, p_test)
+        best_row_mask = test_threshold_table["threshold"] == round(best_threshold, 2)
+        best_row = test_threshold_table.loc[best_row_mask].iloc[0] \
+            if best_row_mask.any() else None
+
+        if best_row is not None:
+            print(f"\n=== {model_name} | Test metrics at threshold {best_threshold} ===")
+            print(best_row.to_string())
+
+        decisions = assign_decisions(y_scores, review_threshold, deny_threshold)
+        decision_counts = pd.Series(decisions).value_counts()
+        n_test = len(y_scores)
+        print(
+            f"\n=== {model_name} | Three-Tier Decisions "
+            f"(T_low={review_threshold}, T_op={best_threshold}, T_high={deny_threshold}) ==="
+        )
+        for d in ["ALLOW", "REVIEW", "DENY"]:
+            cnt = decision_counts.get(d, 0)
+            print(f"  {d}: {cnt} ({cnt / n_test:.1%})")
+
+    # ------------------------------------------------------------------ #
+    #  Multi-class path: macro OvR metrics + threshold tuning on val set  #
+    #  Class encoding: 0=NO_FRAUD_DECISION, 1=FRAUD_SUSPECT, 2=CONFIRM   #
+    #  T_high tuned on p(class 2) vs (y==2)                              #
+    #  T_low  tuned on 1-p(class 0) vs (y>0)                             #
+    #  Decision: p2>=T_high → DENY; (1-p0)>=T_low → REVIEW; else ALLOW  #
+    # ------------------------------------------------------------------ #
     else:
-        best_row = None
+        test_threshold_table = best_row = None
+        y_scores = y_proba
+        pr_thresholds = precision_curve = recall_curve = None
 
-    if best_row is not None:
-        print(f"\n=== {model_name} | Test metrics at threshold {best_threshold} ===")
-        print(best_row.to_string())
+        # Validation-set threshold tuning
+        y_val_proba = model.predict_proba(X_val)
 
-    # Three-tier decisions on test set (using T_low and T_high for operational zones)
-    decisions = assign_decisions(y_scores, review_threshold, deny_threshold)
-    decision_counts = pd.Series(decisions).value_counts()
-    n_test = len(y_scores)
-    print(
-        f"\n=== {model_name} | Three-Tier Decisions "
-        f"(T_low={review_threshold}, T_op={best_threshold}, T_high={deny_threshold}) ==="
-    )
-    for d in ["ALLOW", "REVIEW", "DENY"]:
-        cnt = decision_counts.get(d, 0)
-        print(f"  {d}: {cnt} ({cnt / n_test:.1%})")
+        # T_high: auto-deny when sufficiently confident it is CONFIRM_FRAUD
+        y_val_deny_scores = y_val_proba[:, 2]
+        y_val_deny_labels = (y_val == 2).astype(int)
+        val_deny_table = _build_threshold_table(y_val_deny_labels, y_val_deny_scores)
+        deny_threshold, _ = _select_deny_threshold(val_deny_table, deny_precision_constraint)
+        if deny_threshold is None:
+            deny_threshold = 0.5
 
-    # Feature importance (only for tree-based models)
+        # T_low: route to REVIEW when any-fraud signal is strong enough
+        y_val_review_scores = 1.0 - y_val_proba[:, 0]
+        y_val_review_labels = (y_val > 0).astype(int)
+        val_review_table = _build_threshold_table(y_val_review_labels, y_val_review_scores)
+        review_threshold, _ = _select_review_threshold(val_review_table, review_recall_constraint)
+
+        # T_low must not exceed T_high
+        if review_threshold > deny_threshold:
+            review_threshold = deny_threshold
+
+        best_threshold = deny_threshold  # T_op not separately tuned on multi-class path
+
+        print(
+            f"\n=== {model_name} | Thresholds (validation set): "
+            f"T_low={review_threshold}, T_high={deny_threshold} ==="
+        )
+
+        # Multi-class OvR metrics on test set
+        roc_auc = roc_auc_score(
+            y_test, y_proba, multi_class="ovr", average="macro"
+        )
+        y_bin = label_binarize(y_test, classes=classes)
+        pr_auc = float(np.mean([
+            average_precision_score(y_bin[:, i], y_proba[:, i])
+            for i in range(n_classes)
+        ]))
+
+        # Threshold-based decisions on test set
+        p_deny   = y_proba[:, 2]
+        p_review = 1.0 - y_proba[:, 0]
+        decisions = np.where(
+            p_deny >= deny_threshold,
+            "DENY",
+            np.where(p_review >= review_threshold, "REVIEW", "ALLOW"),
+        )
+        decision_counts = pd.Series(decisions).value_counts()
+        n_test = len(decisions)
+        print(
+            f"\n=== {model_name} | Three-Tier Decisions "
+            f"(T_low={review_threshold}, T_high={deny_threshold}) ==="
+        )
+        for d in ["ALLOW", "REVIEW", "DENY"]:
+            cnt = decision_counts.get(d, 0)
+            print(f"  {d}: {cnt} ({cnt / n_test:.1%})")
+
+    print(f"\n=== {model_name} | ROC-AUC: {roc_auc:.4f} ===")
+    print(f"\n=== {model_name} | PR-AUC:  {pr_auc:.4f} ===")
+
+    # Feature importance (tree-based or linear models)
     if hasattr(model, "feature_importances_"):
         feature_importance = pd.DataFrame(
             {"feature": feature_names, "importance": model.feature_importances_}
@@ -419,17 +486,19 @@ def run_training_pipeline(
         print(f"\n=== {model_name} | Feature Importance ===")
         print(feature_importance.to_string(index=False))
     elif hasattr(model, "coef_"):
+        # coef_ is (1, n_features) for binary, (n_classes, n_features) for multi-class
+        coef_importance = np.abs(model.coef_).mean(axis=0)
         feature_importance = pd.DataFrame(
-            {"feature": feature_names, "importance": np.abs(model.coef_[0])}
+            {"feature": feature_names, "importance": coef_importance}
         ).sort_values("importance", ascending=False)
-        print(f"\n=== {model_name} | Feature Coefficients (abs) ===")
+        print(f"\n=== {model_name} | Feature Coefficients (mean abs) ===")
         print(feature_importance.to_string(index=False))
     else:
         feature_importance = None
 
     # Score distribution by profile if available
     score_distribution = None
-    if p_test is not None:
+    if p_test is not None and n_classes == 2:
         score_distribution = pd.DataFrame(
             {"profile": p_test.values, "y_true": y_test.values, "y_score": y_scores}
         )
@@ -446,6 +515,7 @@ def run_training_pipeline(
         "model": model,
         "target_col": target_col,
         "X_columns": feature_names,
+        "n_classes": n_classes,
         "classification_report": classification_report(
             y_test, y_pred, zero_division=0, output_dict=True
         ),

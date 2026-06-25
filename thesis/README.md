@@ -1,208 +1,130 @@
-# Fraud Detection Using Behavioral and Transactional Features
+# Fraud Detection in Loan Applications: A Multi-Algorithm Approach with Cross-Dataset Validation
 
-MSc Dissertation — Computing and Data Science (CDS)
+Master's Thesis in Computer Science
 
 ## Overview
 
-This project investigates whether combining bot-detection behavioural signals with traditional transactional features improves fraud detection in digital payment systems. A synthetic dataset calibrated from the [PaySim](https://www.kaggle.com/datasets/ealaxi/paysim1) mobile-money simulator is used to train and evaluate multiple classification models under realistic class-imbalance conditions.
+This project builds and evaluates a fraud detection pipeline for loan applications. Fraud is formulated as a **three-class classification problem** — NO_FRAUD_DECISION / FRAUD_SUSPECT / CONFIRM_FRAUD — mapping directly to an operational **ALLOW / REVIEW / DENY** decision system with probability-based threshold calibration.
+
+Features are drawn from two distinct operational data sources per application: transactional signals (loan amounts, credit profile, application context) and behavioral signals (device fingerprint, IP geolocation, rule engine scores). The primary dataset contains **91,984 real-world loan application records**. All models are additionally benchmarked on **PaySim**, a publicly available synthetic mobile money transaction dataset, as a cross-domain generalisation test.
 
 ## Repository Structure
 
 ```
 thesis/
-├── README.md                        # This file
-├── requirements.txt                 # Python dependencies
-├── Thesis.md                        # Dissertation document (Markdown)
+├── README.md                      # This file
+├── requirements.txt               # Python dependencies
 │
-├── data/
-│   └── PS_20174392719_…_log.csv     # PaySim dataset
+├── data_cleaning.py               # JSON extraction, PII masking, feature engineering, imputation
+├── training_pipeline.py           # ML pipeline: encode, train, threshold-tune, evaluate
+├── run_experiment.py              # Primary dataset experiment (multi-seed, all algorithms)
+├── run_paysim_experiment.py       # PaySim cross-domain benchmark
 │
-├── behavioral_dataset.py            # Synthetic behavioral feature generation
-├── fraud_dataset.py                 # Combined synthetic dataset generation (calibrated from PaySim)
-├── paysim_dataset.py                # PaySim parameter extraction (distributions, fraud rates)
-├── generate_dataset_tables.py       # Dataset samples and statistics for thesis
-│
-├── training_pipeline.py             # Reusable ML pipeline: split, encode, train, threshold-tune, evaluate
-├── run_all_models.py                # Orchestrator: multi-seed, multi-algorithm experiments
-├── generate_test_graphs.py          # Test-set performance graphs and literature comparison
-├── validate_distributions.py        # Statistical validation: KS tests, QQ plots, distribution comparison
-│
-├── behavioral_model_training.py     # Standalone: behavioral-only model
-├── transactional_model_training.py  # Standalone: transactional-only model
-├── combined_model_training.py       # Standalone: combined model
-│
-└── results/                         # Generated outputs (CSV tables, PNG plots, Markdown reports)
-    ├── all_seeds_summary.csv
-    ├── aggregated_results.csv
-    ├── test_set_summary.csv / .md
-    ├── literature_comparison.csv / .md
-    ├── sample_*.csv                   # Dataset samples for thesis
-    ├── stats_*.csv                    # Descriptive statistics
-    ├── pr_curves_comparison.png
-    ├── pr_curves_by_feature_set.png
-    ├── roc_curves_comparison.png
-    ├── performance_bar_chart.png
-    ├── decision_distribution.png
-    ├── score_distribution_*.png
-    ├── confusion_matrix_*.png
-    ├── feature_importance_*.png
-    ├── threshold_sensitivity_*.png
-    └── dist_*.png                     # Distribution validation plots
+└── results/
+    ├── class_distribution.png         # Label distribution with counts and percentages
+    ├── performance_comparison.png     # ROC-AUC / PR-AUC bar chart per algorithm
+    ├── decision_distribution.png      # ALLOW / REVIEW / DENY fraction per algorithm
+    ├── score_distributions.png        # Fraud score distributions by true class
+    ├── threshold_curves.png           # Precision / Recall / F1 vs threshold
+    ├── pr_curves.png                  # Precision-Recall curves
+    ├── roc_curves.png                 # ROC curves
+    ├── confusion_matrix_{algo}.png    # Dual-panel: counts + row-normalised rates
+    ├── feature_importance_{algo}.png  # Top feature importances with value labels
+    ├── seed_stability.png             # Mean ± std across seeds (full run only)
+    ├── summary.csv                    # Per-algorithm metrics (seed 42)
+    ├── multi_seed_summary.csv         # Mean ± std across seeds 42, 123, 7
+    └── paysim/                        # Equivalent outputs for PaySim benchmark
+        ├── score_distributions.png    # Fraud score separation (explains threshold degeneration)
+        └── ...
 ```
 
 ## Dataset
 
-The PaySim dataset must be downloaded separately:
+### Primary Dataset
 
-1. Download `PS_20174392719_1491204439457_log.csv` from [Kaggle](https://www.kaggle.com/code/kartik2112/fraud-detection-on-paysim-dataset/data?select=PS_20174392719_1491204439457_log.csv)
-2. Place it in `thesis/data/`
+Raw records must be placed at `../Fraud data/` (one level above `thesis/`). Each row contains three JSON blobs — `application_data`, `device_information_data`, and `fraud_decision_data` — extracted and cleaned by `data_cleaning.py`.
 
-The synthetic dataset is generated programmatically by `fraud_dataset.py` using statistical parameters extracted from PaySim via `paysim_dataset.py`.
+Run cleaning once before experiments:
+
+```bash
+python data_cleaning.py
+```
+
+Output: `fraud_cleaned.csv` — 91,984 rows × 42 columns.
+
+### PaySim
+
+Download `PS_20174392719_1491204439457_log.csv` from [Kaggle](https://www.kaggle.com/datasets/ealaxi/paysim1) and place it at `../Fraud data/PS_20174392719_1491204439457_log.csv`. The experiment script loads and samples it automatically.
 
 ## Setup
 
 ```bash
-# Create virtual environment
 python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
+source .venv/bin/activate   # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-### Requirements
-
-- Python 3.10+
-- scikit-learn 1.8+
-- pandas, numpy, matplotlib, tabulate
-- Faker (for synthetic data generation)
+Requires Python 3.10+.
 
 ## Reproducing Results
 
-### Complete Execution Order
-
-To fully replicate all results in the thesis, execute scripts in this order:
-
-#### 1. Generate Dataset Tables for Thesis
+### Primary Dataset (multi-seed, full grid search)
 
 ```bash
-python generate_dataset_tables.py
+python run_experiment.py
 ```
 
-Creates sample datasets and descriptive statistics used in Section 5.1.1 of the thesis. Outputs to `results/`:
+Runs grid search on seed 42 (5-fold CV, PR-AUC scorer), then re-evaluates best parameters on seeds 42, 123, and 7. Reports mean ± std across seeds. **Expected runtime: several hours** (Gradient Boosting grid search is the bottleneck).
 
-- `sample_*.csv` — Sample behavioral, transactional, and combined datasets
-- `stats_*.csv` — Descriptive statistics for each feature set
-- Markdown tables for direct inclusion in thesis
-
-#### 2. Validate Synthetic Data Distributions
+### Primary Dataset (quick, seed 42 only)
 
 ```bash
-python validate_distributions.py
+python run_experiment.py --no-grid-search
 ```
 
-Compares synthetic data distributions against PaySim using KS tests, QQ plots, and fraud rate analysis. Generates both unimodal and multimodal comparisons to demonstrate the improvement. Outputs plots and statistics to `results/`:
+Uses fixed hyperparameters, single seed. Completes in minutes. Use this to regenerate figures without re-running grid search.
 
-- `dist_*_unimodal.png` — Unimodal approach plots
-- `dist_*_multimodal.png` — Multimodal approach plots (current method)
-- KS test comparison showing improvement
-
-#### 3. Run Full Experiment Suite (Multi-Seed)
+### PaySim Benchmark
 
 ```bash
-python run_all_models.py
+python run_paysim_experiment.py                # full grid search
+python run_paysim_experiment.py --no-grid-search   # quick figures only
 ```
 
-**Primary experiment** - trains 4 algorithms × 3 feature sets × 5 random seeds = 60 model configurations under precision ≥ 0.50 constraint. Outputs:
-
-- `results/all_seeds_summary.csv` — per-seed metrics (used for Tables 5.5, 5.6, 5.7)
-- `results/aggregated_results.csv` — mean ± std across seeds (used for Table 5.4)
-- `results/test_set_summary.csv` — test set metrics for seed=42
-- Precision-constraint sweep analysis (Section 5.3.2)
-
-**Expected runtime:** ~1–2 hours depending on hardware.
-
-#### 4. Generate Test Set Performance Graphs
-
-```bash
-python generate_test_graphs.py
-```
-
-Runs 12 configurations (seed=42) and produces all visualization plots with precision ≥ 0.50 constraint:
-
-- `threshold_sensitivity_*.png` — Threshold sensitivity curves with 0.50 constraint line
-- `pr_curves_*.png` — Precision-recall curves
-- `roc_curves_*.png` — ROC curves
-- `confusion_matrix_*.png` — Confusion matrices
-- `feature_importance_*.png` — Feature importance rankings
-- `decision_distribution.png` — Three-tier decision distribution with T_low, T_op, and T_high annotations
-- `score_distribution_*.png` — Score distribution histograms with threshold lines
-- `literature_comparison.md` — Updated with Combined RF and GB results (Table 5.13)
-- `test_set_summary.md` — Test set summary table
-
-#### 5. Run Individual Models (Optional)
-
-```bash
-python behavioral_model_training.py
-python transactional_model_training.py
-python combined_model_training.py
-```
-
-For debugging or testing individual feature sets. All use precision ≥ 0.50 constraint.
-
-### Critical Notes for Replication
-
-1. **Precision Constraint**: All experiments use precision ≥ 0.50 (not 0.90) based on the constraint sweep analysis (Section 5.3.2)
-2. **Random Seeds**: Multi-seed experiments use seeds [42, 123, 456, 789, 2024] for statistical robustness
-3. **Data Dependencies**: PaySim dataset must be in `data/` directory before running any scripts
-4. **Output Order**: Scripts generate outputs incrementally - later scripts depend on earlier outputs
+All outputs are written to `results/paysim/`.
 
 ## Algorithms
 
-| Algorithm               | Role                               |
-| ----------------------- | ---------------------------------- |
-| DummyClassifier (prior) | Baseline — predicts majority class |
-| Logistic Regression     | Linear baseline                    |
-| Random Forest           | Primary ensemble method            |
-| Gradient Boosting       | Secondary ensemble method          |
+| Algorithm | Type |
+|---|---|
+| `dummy` | Majority-class baseline |
+| `logistic_regression` | Linear model |
+| `random_forest` | Bagging ensemble |
+| `gradient_boosting` | Boosting ensemble |
+
+All sklearn models use `class_weight='balanced'`. Hyperparameter search uses `GridSearchCV` with 5-fold stratified CV scored on PR-AUC.
 
 ## Three-Tier Decision System
 
-The pipeline produces a fraud probability score per transaction and maps it to an operational decision using three thresholds tuned on the validation set:
+| Score condition | Decision | Operational action |
+|---|---|---|
+| Below T\_low | **ALLOW** | Auto-approve |
+| T\_low ≤ score < T\_high | **REVIEW** | Route to fraud analyst |
+| Score ≥ T\_high | **DENY** | Auto-reject |
 
-| Score Range            | Decision   | Action                                |
-| ---------------------- | ---------- | ------------------------------------- |
-| Score < T_low          | **ALLOW**  | Auto-approve (low risk, recall ≥ 95%) |
-| T_low ≤ Score < T_high | **REVIEW** | Manual review queue (recall < 95%)    |
-| Score ≥ T_high         | **DENY**   | Auto-block (precision ≥ 70%)          |
+Thresholds are tuned on the validation set: T\_high maximises precision ≥ 70% on CONFIRM\_FRAUD; T\_low is the highest threshold that retains recall ≥ 95% on any-fraud cases. On PaySim, tree ensemble thresholds degenerate (T\_low > T\_high), collapsing the system to binary ALLOW / DENY — a finding documented in the thesis as a diagnostic of fraud pattern simplicity.
 
-- **T_high (DENY threshold, precision ≥ 0.70)**: The lowest threshold where at least 70% of flagged transactions are truly fraudulent. Transactions scoring ≥ T_high are automatically denied.
-- **T_op (Operational threshold, precision ≥ 0.50)**: The highest-recall threshold that still maintains at least 50% precision. This represents the recommended operating point that balances detection coverage with false positive control.
-- **T_low (REVIEW threshold, recall ≥ 0.95)**: The highest threshold that captures at least 95% of known fraud. Transactions scoring between T_low and T_high are flagged for manual review, ensuring that most fraudulent cases are captured within the review or denial tiers.
+## Key Results
 
-## Key Findings
+| Algorithm | Primary ROC-AUC | Primary PR-AUC | PaySim ROC-AUC | PaySim PR-AUC |
+|---|---|---|---|---|
+| Dummy | 0.5000±0.0000 | 0.3333±0.0000 | 0.5000 | 0.0909 |
+| Logistic Regression | 0.7441±0.0092 | 0.5417±0.0170 | 0.9886 | 0.9327 |
+| Random Forest | 0.9962±0.0004 | 0.9835±0.0012 | **0.9994** | **0.9985** |
+| **Gradient Boosting** | **0.9966±0.0002** | **0.9855±0.0009** | 0.9987 | 0.9928 |
 
-### Main Results (Precision ≥ 0.50 Constraint)
-
-- **Combined models significantly improve fraud detection**: Adding behavioral features to transactional features increases PR-AUC by ~38% for both RF (0.583 vs 0.419) and GB (0.584 vs 0.426)
-- **Recall improvements dramatic**: Combined GB achieves 0.524 ± 0.065 vs Transactional GB's 0.134 ± 0.104 — nearly 4× improvement
-- **Behavioral features excel at bot detection**: Behavioral RF achieves ROC-AUC 0.919 ± 0.015 and PR-AUC 0.852 ± 0.026
-- **Stealth bot detection**: Under precision ≥ 0.50, stealth bot recall reaches 0.947 ± 0.042 (RF), exceeding overall bot recall
-
-### Three-Tier Threshold System
-
-- **T_high**: Precision ≥ 0.70 for automatic denial
-- **T_op**: Precision ≥ 0.50 for operational reference point
-- **T_low**: Recall ≥ 0.95 for manual review queue
+Primary metrics are mean ± std across seeds 42, 123, 7. PaySim metrics are single-seed.
 
 ## Hardware
 
-Experiments were run on:
-
-- MacBook Pro (16-inch, 2021)
-- Apple M1 Max
-- 32 GB RAM
-
-## License
-
-This project is part of an MSc dissertation and is not licensed for commercial use.
+Experiments were run on Apple M-series CPU (macOS).

@@ -1,0 +1,5 @@
+algorithm,roc_auc,pr_auc,t_low,t_op,t_high
+dummy,0.5,0.0909,0.05,0.5,0.5
+logistic_regression,0.9887,0.9327,0.3,0.3,0.6
+random_forest,0.9987,0.9976,0.1,0.05,0.05
+gradient_boosting,0.9986,0.9794,0.95,0.05,0.05

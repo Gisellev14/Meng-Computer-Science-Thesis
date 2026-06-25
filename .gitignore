@@ -1,1 +1,16 @@
 thesis/data/PS_20174392719_1491204439457_log.csv
+
+# Raw and intermediate data — only the cleaned output is committed
+Fraud data/fraud_training*.csv
+Fraud data/fraud_combined.csv
+
+# Experiment logs
+*.log
+
+# macOS metadata
+.DS_Store
+thesis/.DS_Store
+
+# Python cache
+__pycache__/
+*.pyc
